@@ -1,0 +1,1 @@
+Code for using self-play to do objectnav in habitat
