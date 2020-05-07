@@ -32,6 +32,11 @@ TASK:
     TYPE: Nav-v0
     POSSIBLE_ACTIONS: ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"]
     SENSORS: ['GPS_SENSOR']
+
+# TASK:
+#     TYPE: ObjectNav-v0
+#     POSSIBLE_ACTIONS: ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"]
+#     SENSORS: ['OBJECTGOAL_SENSOR', 'COMPASS_SENSOR', 'GPS_SENSOR']
     
 
 RL:
@@ -53,3 +58,4 @@ RL:
     use_linear_clip_decay: True
     use_linear_lr_decay: True
     reward_window_size: 50
+    gamma_alice_bob: 1
