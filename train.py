@@ -1,3 +1,4 @@
+import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
@@ -9,7 +10,7 @@ from habitat_baselines.common.utils import batch_obs
 
 from envs import HabitatEnv
 #from agents import AliceBobAgent
-from models import ObjectNavBaselinePolicy
+from models import NavResNetPolicy
 
 
 class Trainer:
@@ -41,6 +42,9 @@ class Trainer:
             recurrent_hidden_state_size=self.ppo_cfg.hidden_size,
         )
 
+        self.alice_rewards = []
+        self.bob_rewards = []
+
     def train(self):
         obs = self.env.reset()
         obs[self.static_sensor_uuid] = obs['gps']
@@ -58,35 +62,39 @@ class Trainer:
         obs = None
 
         # Main training loop
-        for update in range(self.config.NUM_UPDATES):
+        #for update in range(self.config.NUM_UPDATES):
+        for update in range(1):
             t_alice = 0
             t_max = self.ppo_cfg.num_steps
-            obs = self.env.observe()
+            obs = self.env.reset()
             start_state = torch.from_numpy(obs['gps'])
+            #print(f"interation: {update}, Alice: {obs['gps']}")
 
             # Alice's turn
             while True:
-                t_alice += 1
                 goal_state, alice_done = self._alice_training_step(self.rollouts_alice, t_alice, t_max, start_state)
 
-                break
-
                 if alice_done:
+                    print("Alice done!")
                     break
 
-            print(v)
+                t_alice += 1
 
+            #goal_state = torch.from_numpy(goal_state).float()
+            print(f"goal state: {goal_state}")
             # Bob's turn
             obs = self.env.reset()
             t_bob = 0
-            while t_alice + t_bob < t_max:
+            while t_alice + t_bob < t_max + 1:
                 bob_done = self._bob_training_step(self.rollouts_bob, goal_state, t_bob, t_alice,
                     t_max,
                 )
 
-                t_bob += 1
                 if bob_done:
+                    print("Bob done!")
                     break
+
+                t_bob += 1
 
             # Calculate episode reward
             self._compute_rewards(t_alice, t_bob)
@@ -94,6 +102,11 @@ class Trainer:
             # Policy update
             value_loss, action_loss, dist_entropy = self._update_agent(self.ppo_cfg, self.rollouts_alice, self.actor_critic_alice, self.agent_alice)
             value_loss, action_loss, dist_entropy = self._update_agent(self.ppo_cfg, self.rollouts_bob, self.actor_critic_bob, self.agent_bob)
+
+        # a, = plt.plot(np.arange(100) , self.alice_rewards, label="Alice")
+        # b, = plt.plot(np.arange(100) , self.bob_rewards, label="Bob")
+        # plt.legend(handles=[a, b])
+        # plt.show()
 
     def _alice_training_step(self, rollouts, t_alice, t_max, start_state):
         # Collect the current observation from alice's rollout memory
@@ -110,17 +123,7 @@ class Trainer:
             )
 
         action = actions[0][0].item() # until multiple parallel envs setup, have to index in
-
-        print(f"t_alice: {t_alice}, action: {action}")
-
-        # Either alice output STOP action or alice timed out
-        goal_state = None
-        if (action == 0 and t_alice > 1) or t_alice >= t_max: # 0 is the STOP action
-            goal_state = step_obs['gps'].squeeze()
-            return goal_state, True
-
-        self.env._env._episode_over = False
-        obs, rewards, dones, infos = self.env.step(action)
+        obs, rewards, dones, infos = self.env.step(action, alice=True, train=True)
         obs['static'] = start_state
 
         # Update alice's rollout memory
@@ -144,7 +147,16 @@ class Trainer:
             masks,
         )
 
-        return goal_state, False
+        # Either alice output STOP action or alice timed out
+        goal_state = None
+        alice_done = False
+        if dones[0] or t_alice >= t_max: # 0 is the STOP action
+            goal_state = torch.from_numpy(obs['gps'].squeeze()).float()
+            alice_done = True
+
+        print(f"Alice: time: {t_alice}, before state: {step_obs['gps']}, action taken: {action}, new state: {obs['gps']}, reward: {rewards[0]}, done: {dones[0]}")
+
+        return goal_state, alice_done
 
     def _bob_training_step(self, rollouts, goal_state, t_bob, t_alice, t_max):
         with torch.no_grad():
@@ -152,12 +164,12 @@ class Trainer:
                 k: v[rollouts.step] for k, v in rollouts.observations.items()
             }
 
-            bob_cur_state = step_obs['gps']
-            print(f"t_bob: {t_bob}, goal_state: {goal_state}, bob_state: {bob_cur_state}")
-            bob_done = False
-            if (self._reached_goal(bob_cur_state, goal_state) and t_bob > 0) or t_alice + t_bob >= t_max:
-                bob_done = True
-                return bob_done
+            # bob_cur_state = step_obs['gps']
+            # #print(f"t_bob: {t_bob}, goal_state: {goal_state}, bob_state: {bob_cur_state}")
+            # bob_done = False
+            # if (self._reached_goal(bob_cur_state, goal_state) and t_bob > 0) or t_alice + t_bob > t_max:
+            #     bob_done = True
+            #     return bob_done
 
             # TODO: Might change policy to take in start and current state
             values, actions, actions_log_probs, hidden_states = self.actor_critic_bob.act(
@@ -168,11 +180,10 @@ class Trainer:
             )
 
         action = actions[0][0].item()
-        print(f"bob action: {action}")
-        self.env._env._episode_over = False
-        obs, rewards, dones, info = self.env.step(action)
+        obs, rewards, dones, info = self.env.step(action, static_state=goal_state, alice=False, train=True)
         obs['static'] = goal_state
 
+        # Update Bob's rollout memory
         batch = batch_obs([obs], device=self.device)
         rewards = torch.tensor([rewards], dtype=torch.float)
         rewards = rewards.unsqueeze(1)
@@ -193,10 +204,13 @@ class Trainer:
             masks,
         )
 
-        return bob_done
+        bob_done = False
+        if dones[0] or t_alice + t_bob >= t_max:
+            bob_done = True
 
-    def _reached_goal(self, bob_cur_state, goal_state):
-        return torch.dist(bob_cur_state, goal_state, p=2) <= 0.2
+        print(f"Bob: time: {t_bob}, before state: {step_obs['gps']}, action taken: {action}, new state: {obs['gps']}, reward: {rewards[0]}, done: {dones[0]}")
+
+        return bob_done
 
     def _compute_rewards(self, t_a, t_b):
         # Reward formula
@@ -211,6 +225,9 @@ class Trainer:
         self.rollouts_alice.rewards[alice_step - 1, 0, 0] = r_alice
         bob_step = self.rollouts_bob.step
         self.rollouts_bob.rewards[bob_step - 1, 0, 0] = r_bob
+
+        self.alice_rewards.append(r_alice)
+        self.bob_rewards.append(r_bob)
 
     def _update_agent(self, ppo_cfg, rollouts, actor_critic, agent):
         #t_update_model = time.time()
@@ -251,15 +268,34 @@ class Trainer:
         pass
 
     def init_policy_and_agents(self, ppo_cfg):
-        self.actor_critic_alice = ObjectNavBaselinePolicy(
+        # self.actor_critic_alice = ObjectNavBaselinePolicy(
+        #     observation_space=self.env.observation_space,
+        #     action_space=self.env.action_space,
+        #     hidden_size=self.ppo_cfg.hidden_size,
+        # )
+        # self.actor_critic_bob = ObjectNavBaselinePolicy(
+        #     observation_space=self.env.observation_space,
+        #     action_space=self.env.action_space,
+        #     hidden_size=self.ppo_cfg.hidden_size,
+        # )
+
+        self.actor_critic_alice = NavResNetPolicy(
             observation_space=self.env.observation_space,
             action_space=self.env.action_space,
-            hidden_size=self.ppo_cfg.hidden_size,
+            hidden_size=ppo_cfg.hidden_size,
+            rnn_type=self.config.RL.PPO.rnn_type,
+            num_recurrent_layers=self.config.RL.PPO.num_recurrent_layers,
+            backbone=self.config.RL.PPO.backbone,
+            normalize_visual_inputs=True
         )
-        self.actor_critic_bob = ObjectNavBaselinePolicy(
+        self.actor_critic_bob = NavResNetPolicy(
             observation_space=self.env.observation_space,
             action_space=self.env.action_space,
-            hidden_size=self.ppo_cfg.hidden_size,
+            hidden_size=ppo_cfg.hidden_size,
+            rnn_type=self.config.RL.PPO.rnn_type,
+            num_recurrent_layers=self.config.RL.PPO.num_recurrent_layers,
+            backbone=self.config.RL.PPO.backbone,
+            normalize_visual_inputs=True
         )
 
         self.agent_alice = PPO(
